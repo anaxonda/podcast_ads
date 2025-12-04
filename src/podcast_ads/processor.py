@@ -1,5 +1,6 @@
 import ffmpeg
 import os
+import subprocess
 from typing import List, Dict
 from pathlib import Path
 from .utils import parse_timestamp
@@ -19,54 +20,60 @@ class AudioProcessor:
             console.print(f"[red]Error probing file: {e.stderr}[/red]")
             raise
 
-    def create_chunked_proxies(self, input_path: str, chunk_minutes: int = 10) -> List[tuple[str, float]]:
+    def transcribe_local(self, input_path: str, model_size: str = "tiny", output_dir: str = ".") -> str:
         """
-        Creates lightweight MP3 proxy chunks (mono, 64k).
-        Returns a list of (file_path, start_offset_seconds) tuples.
+        Transcribes audio locally using whisper-ctranslate2.
+        Returns the path to the generated JSON transcript file.
         """
         input_p = Path(input_path)
-        chunk_seconds = chunk_minutes * 60
+        out_p = Path(output_dir)
+        expected_json = out_p / f"{input_p.stem}.json"
         
-        # Pattern for ffmpeg output: .tmp_proxy_stem_000.mp3
-        output_pattern = input_p.parent / f".tmp_ai_proxy_{input_p.stem}_%03d.mp3"
-        
-        # Clean up previous runs if any
-        for existing in input_p.parent.glob(f".tmp_ai_proxy_{input_p.stem}_*.mp3"):
-            existing.unlink()
+        # Check if already exists
+        if expected_json.exists():
+             console.log(f"[yellow]Found existing transcript at {expected_json}, skipping Whisper.[/yellow]")
+             return str(expected_json)
 
-        console.log(f"[cyan]Splitting {input_p.name} into {chunk_minutes}-minute proxy chunks...[/cyan]")
+        console.log(f"[cyan]Starting local transcription with Whisper ({model_size})...[/cyan]")
+        
+        # cmd = [
+        #     "whisper-ctranslate2",
+        #     str(input_path),
+        #     "--model", model_size,
+        #     "--compute_type", "int8",
+        #     "--device", "cpu",
+        #     "--output_format", "json",
+        #     "--output_dir", str(output_dir),
+        #     "--threads", str(os.cpu_count() or 4) # Maximize CPU usage
+        # ]
+        cmd = [
+    "whisper-ctranslate2",
+    str(input_path),
+    "--model", "tiny",
+    "--language", "en",           # Specify language to skip detection
+    "--compute_type", "int8",     # CPU Optimized
+    "--device", "cpu",
+    "--threads", "4", # USE PHYSICAL CORES ONLY
+    "--beam_size", "1",           # Greedy decoding (Faster)
+    "--batched", "True",          # Enable batching
+    "--batch_size", "8",          # Process 8 chunks at once
+    "--vad_filter", "True",       # Skip silent parts
+    "--output_format", "json",
+    "--output_dir", str(output_dir)
+]
         
         try:
-            with console.status("[bold yellow]FFmpeg is segmenting audio (this might take a minute)...[/bold yellow]", spinner="bouncingBar"):
-                (
-                    ffmpeg
-                    .input(input_path)
-                    .output(
-                        str(output_pattern), 
-                        f="segment", 
-                        segment_time=chunk_seconds, 
-                        reset_timestamps=1,
-                        ac=1, 
-                        ar=44100, 
-                        audio_bitrate="64k"
-                    )
-                    .overwrite_output()
-                    .run(quiet=True)
-                )
+            with console.status(f"[bold yellow]Transcribing locally... (this will take several minutes)[/bold yellow]", spinner="bouncingBar"):
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
-            # Collect results
-            chunks = []
-            found_files = sorted(input_p.parent.glob(f".tmp_ai_proxy_{input_p.stem}_*.mp3"))
-            
-            for i, f_path in enumerate(found_files):
-                offset = i * chunk_seconds
-                chunks.append((str(f_path), offset))
+            if expected_json.exists():
+                console.log(f"[green]Transcription complete: {expected_json}[/green]")
+                return str(expected_json)
+            else:
+                raise FileNotFoundError(f"Whisper finished but {expected_json} was not found.")
                 
-            console.log(f"[green]Created {len(chunks)} chunks for processing.[/green]")
-            return chunks
-            
-        except ffmpeg.Error as e:
-            console.print(f"[red]Error creating proxy chunks: {e.stderr.decode()}[/red]")
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]Whisper Error:[/red] {e.stderr.decode() if e.stderr else str(e)}")
             raise
 
     def cut_and_merge(self, input_path: str, output_path: str, remove_segments: List[Dict]):

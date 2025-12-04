@@ -10,6 +10,7 @@ dependencies = [
     "python-dotenv",
     "rich",
     "typer",
+    "whisper-ctranslate2",
 ]
 
 [build-system]
