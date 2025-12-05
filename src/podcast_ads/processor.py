@@ -35,35 +35,26 @@ class AudioProcessor:
              return str(expected_json)
 
         console.log(f"[cyan]Starting local transcription with Whisper ({model_size})...[/cyan]")
+        console.log("[dim]Settings: int8, beam=1, batch=8, vad=True[/dim]")
         
-        # cmd = [
-        #     "whisper-ctranslate2",
-        #     str(input_path),
-        #     "--model", model_size,
-        #     "--compute_type", "int8",
-        #     "--device", "cpu",
-        #     "--output_format", "json",
-        #     "--output_dir", str(output_dir),
-        #     "--threads", str(os.cpu_count() or 4) # Maximize CPU usage
-        # ]
         cmd = [
-    "whisper-ctranslate2",
-    str(input_path),
-    "--model", "tiny",
-    "--language", "en",           # Specify language to skip detection
-    "--compute_type", "int8",     # CPU Optimized
-    "--device", "cpu",
-    "--threads", "4", # USE PHYSICAL CORES ONLY
-    "--beam_size", "1",           # Greedy decoding (Faster)
-    "--batched", "True",          # Enable batching
-    "--batch_size", "8",          # Process 8 chunks at once
-    "--vad_filter", "True",       # Skip silent parts
-    "--output_format", "json",
-    "--output_dir", str(output_dir)
-]
+            "whisper-ctranslate2",
+            str(input_path),
+            "--model", model_size,
+            "--language", "en",
+            "--compute_type", "int8",
+            "--device", "cpu",
+            "--output_format", "json",
+            "--output_dir", str(output_dir),
+            "--threads", "4",
+            "--beam_size", "1",
+            "--batched", "True",
+            "--batch_size", "4",
+            "--vad_filter", "True"
+        ]
         
         try:
-            with console.status(f"[bold yellow]Transcribing locally... (this will take several minutes)[/bold yellow]", spinner="bouncingBar"):
+            with console.status(f"[bold yellow]Transcribing locally...[/bold yellow]", spinner="bouncingBar"):
                 subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
             if expected_json.exists():

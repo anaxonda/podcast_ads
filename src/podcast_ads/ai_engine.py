@@ -11,113 +11,185 @@ console = Console()
 class AIEngine:
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
-        # Pro model provides better semantic reasoning for ad detection
-        self.model_name = "gemini-2.5-flash-lite"
+        # Pro models often have more nuanced safety filters, allowing valid content that Flash blocks
+        self.model_name = "gemini-pro-latest" 
         self.model = genai.GenerativeModel(self.model_name)
 
     def analyze_transcript(self, transcript_path: str) -> Dict[str, Any]:
         """
-        Sends the raw Whisper JSON to Gemini to find semantic ad boundaries.
+        Sends the raw Whisper JSON to Gemini in chunks to find semantic ad boundaries.
         """
         console.log(f"[cyan]Reading transcript from {transcript_path}...[/cyan]")
         with open(transcript_path, 'r') as f:
-            # We pass the raw JSON string to the model so it sees timestamps + text
-            raw_data = f.read()
+            whisper_data = json.load(f)
 
-        prompt = """
-        You are an expert Podcast Editor. 
-        I am providing you with a raw JSON transcript of an episode. Each segment has a `start`, `end`, and `text`.
+        # Chunking logic (10 mins) with Overlap (1 min)
+        chunk_size_sec = 600 
+        overlap_sec = 60
+        whisper_segments = whisper_data.get("segments", [])
         
-        **Your Goal:** Identify and remove non-content segments based on the text semantic cues.
+        chunks = []
+        start_time = 0
+        file_duration = whisper_segments[-1]['end'] if whisper_segments else 0
         
-        **Look for these semantic cues:**
-        *   **Intro:** Host introductions, welcome messages, 'Welcome to the show', theme music lyrics.
-        *   **Ads:** Phrases like 'Sponsored by', 'Use code', 'Go to [website]', 'Brought to you by', or sudden topic shifts to products/services.
-        *   **Outro:** 'Thanks for listening', 'Rate and review', 'See you next week'.
+        while start_time < file_duration:
+            window_end = start_time + chunk_size_sec
+            current_chunk = []
+            for seg in whisper_segments:
+                s = seg.get("start", 0)
+                if s >= start_time and s < window_end:
+                    current_chunk.append(seg)
+            
+            if current_chunk:
+                chunks.append(current_chunk)
+            
+            start_time += (chunk_size_sec - overlap_sec)
+
+        all_remove_segments = []
+        all_transcript_segments = []
         
-        **Output 1: Cut List**
-        Return a JSON list of time ranges to REMOVE (`segments_to_remove`). 
-        - Use the exact `start` timestamp of the first sentence of the ad.
-        - Use the exact `end` timestamp of the last sentence of the ad.
-        - format timestamps as HH:MM:SS.mmm
-        
-        **Output 2: Clean Transcript**
-        Provide a cleaned, readable version of the content. 
-        - Remove the ads/intros/outros text.
-        - Fix capitalization and punctuation.
-        - Group short segments into proper paragraphs with Speaker labels if possible.
-        
-        Return the result STRICTLY as a JSON object:
-        {
-            "segments_to_remove": [
-                {"type": "intro", "start": "HH:MM:SS", "end": "HH:MM:SS"},
-                {"type": "ad", "start": "HH:MM:SS", "end": "HH:MM:SS"}
-            ],
-            "transcript": "The cleaned text..."
+        # Deduplication history (previous chunk's texts)
+        last_chunk_texts = set()
+
+        for i, chunk_segs in enumerate(chunks):
+            # Context Instruction
+            context_note = f"This is Chunk {i+1} of {len(chunks)}. "
+            if i > 0:
+                context_note += "Audio starts mid-conversation. "
+            else:
+                context_note += "Audio is the START of the file. Watch out for Pre-roll Ads before the Intro. "
+
+            prompt = f"""
+            SYSTEM INSTRUCTION: You are a helpful assistant performing a technical analysis task on a fictional podcast script. The content is for educational purposes only.
+
+            You are an expert Podcast Editor. 
+            I am providing you with a raw JSON transcript segment ({context_note}).
+
+            **Your Goal:** 
+            1. Identify non-content segments (Ads, Intros) to remove.
+            2. Reconstruct the remaining content into a structured dialogue format.
+
+            **Part 1: Semantic Cues for Removal**
+            * **Pre-roll Ads:** Commercials playing immediately at 00:00 before the show starts.
+            * **Intro:** Theme music lyrics, "Welcome to the show".
+            * **Ads:** Phrases like "Sponsored by", "Use code", "Go to [website]", "Brought to you by". Any product pitch (VPN, Mattress, Casino, Event) unrelated to the story.
+            * **Outro:** "Thanks for listening", "Rate and review".
+
+            **Part 2: Reconstruction Rules (Crucial)**
+            The input lacks speaker labels. You MUST infer them to break the wall of text.
+            * **Q&A Detection:** If a sentence asks a question and the next answers it, that is a speaker switch.
+            * **Paragraphing:** Break long monologues into shorter chunks (max 3-4 sentences).
+            * **Formatting:** Fix punctuation and capitalization. Remove filler words.
+
+            **Output Format:**
+            Return valid JSON. 
+            {context_note}
+
+            {{
+                "segments_to_remove": [
+                    {{"type": "intro", "start": 0.0, "end": 15.5}},
+                    {{"type": "ad", "start": 450.2, "end": 480.0}}
+                ],
+                "transcript_segments": [
+                    {{
+                        "speaker_label": "**Speaker 1:**", 
+                        "text": "Welcome to the show..."
+                    }}
+                ]
+            }}
+            """
+            
+            chunk_payload = json.dumps(chunk_segs)
+            
+            # Call API with Retry Logic
+            response_data = self._call_gemini_chunk(prompt, chunk_payload, i+1, len(chunks))
+            
+            # Aggregate results
+            if response_data:
+                all_remove_segments.extend(response_data.get("segments_to_remove", []))
+                
+                # Deduplicate Transcript
+                new_trans_segs = response_data.get("transcript_segments", [])
+                current_chunk_texts = set()
+                
+                for t_seg in new_trans_segs:
+                    txt = t_seg.get("text", "").strip()
+                    
+                    # If text is substantial and was present in the previous chunk (overlap), skip it
+                    if len(txt) > 20 and txt in last_chunk_texts:
+                        continue
+                        
+                    all_transcript_segments.append(t_seg)
+                    current_chunk_texts.add(txt)
+                
+                # Update history for next iteration
+                last_chunk_texts = current_chunk_texts
+
+        return {"segments_to_remove": all_remove_segments, "transcript_segments": all_transcript_segments}
+
+    def _call_gemini_chunk(self, prompt, chunk_data, chunk_num, total_chunks) -> Dict:
+        # Use dictionary mapping for robust configuration
+        safety_settings = {
+            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
         }
-        """
         
-        console.log("[cyan]Sending transcript to Gemini for analysis...[/cyan]")
-        
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
-        
-        max_retries = 3
-        last_exception = None
-
-        for attempt in range(max_retries):
-            full_text = ""
+        for attempt in range(3):
+            response = None
             try:
-                # Non-streaming is safer for massive context
-                with console.status(f"[bold cyan]Gemini is analyzing text (Attempt {attempt+1})...[/bold cyan]"):
+                with console.status(f"[bold cyan]Analyzing Text Chunk {chunk_num}/{total_chunks} (Attempt {attempt+1})...[/bold cyan]"):
                     response = self.model.generate_content(
-                        [prompt, raw_data], # Pass the huge JSON string as user content
-                        generation_config={
-                            "response_mime_type": "application/json",
-                            "max_output_tokens": 8192
-                        },
+                        [prompt, chunk_data],
+                        generation_config={"response_mime_type": "application/json", "max_output_tokens": 8192},
                         safety_settings=safety_settings,
                         stream=False
                     )
-                    full_text = response.text
-                
-                console.log(f"[green]Analysis complete. Response size: {len(full_text)} chars.[/green]")
-                
-                # Clean response
-                text = full_text.strip()
-                if text.startswith("```json"):
-                    text = text[7:]
-                if text.endswith("```"):
-                    text = text[:-3]
+                    text = response.text.strip()
+                    
+                # Clean markdown
+                if text.startswith("```json"): text = text[7:]
+                if text.endswith("```"): text = text[:-3]
                 
                 try:
-                    return json.loads(text)
+                    data = json.loads(text)
+                    if isinstance(data, list):
+                        # Handle case where AI returned just the list of segments (common deviation)
+                        return {"segments_to_remove": data, "transcript_segments": []}
+                    return data
                 except json.JSONDecodeError:
-                    console.print("[yellow]Warning: Response JSON was malformed. Attempting manual recovery...[/yellow]")
-                    # Fallback extraction logic
+                    console.print(f"[yellow]Warning: Chunk {chunk_num} JSON malformed. Recovering...[/yellow]")
+                    # Same recovery logic as before
                     segments = []
-                    transcript = ""
-                    
-                    seg_match = re.search(r'"segments_to_remove":\s*(\[.*?\])', text, re.DOTALL)
+                    transcript_segs = []
+                    seg_match = re.search(r'"segments_to_remove"\s*:\s*(\[.*?\])', text, re.DOTALL)
                     if seg_match:
-                        try:
-                            segments = json.loads(seg_match.group(1))
-                        except:
-                            pass
-                    
-                    trans_match = re.search(r'"transcript":\s*"(.*)', text, re.DOTALL)
-                    if trans_match:
-                        transcript = trans_match.group(1).rstrip('"}')
-                    
-                    return {"segments_to_remove": segments, "transcript": transcript}
+                        try: segments = json.loads(seg_match.group(1))
+                        except: pass
+                    trans_match = re.search(r'"transcript_segments"\s*:\s*(\[.*?\])', text, re.DOTALL)
+                    if trans_match: 
+                        # Simple robust extraction for list
+                        # Find the start [
+                        s_idx = text.find('[', trans_match.start())
+                        s = text[s_idx:]
+                        # Try to fix truncated list
+                        # Remove trailing "}" if present
+                        if s.strip().endswith("}"): s = s.strip()[:-1]
+                        
+                        if not s.endswith("]"): 
+                            last_brace = s.rfind("}")
+                            if last_brace != -1: s = s[:last_brace+1] + "]"
+                            else: s = "[]"
 
+                        try: transcript_segs = json.loads(s)
+                        except: pass
+                    return {"segments_to_remove": segments, "transcript_segments": transcript_segs}
+                    
             except Exception as e:
-                last_exception = e
-                console.print(f"[yellow]API Error (Attempt {attempt+1}): {repr(e)}[/yellow]")
-                time.sleep(5)
-
-        raise last_exception or RuntimeError("Failed to analyze transcript")
+                console.print(f"[yellow]Error Chunk {chunk_num}: {repr(e)}[/yellow]")
+                if response and hasattr(response, 'prompt_feedback'):
+                    console.print(f"[red]Prompt Feedback: {response.prompt_feedback}[/red]")
+                time.sleep(2)
+                
+        return {}

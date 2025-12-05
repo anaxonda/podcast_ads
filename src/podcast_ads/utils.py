@@ -1,15 +1,20 @@
-def parse_timestamp(timestamp_str: str) -> float:
+from typing import Any
+
+def parse_timestamp(timestamp: Any) -> float:
     """
-    Converts HH:MM:SS or MM:SS string to seconds (float).
-    Examples:
-        "00:01:30" -> 90.0
-        "1:30" -> 90.0
-        "90" -> 90.0
+    Converts HH:MM:SS string, MM:SS string, or raw float/int to seconds (float).
     """
+    if timestamp is None:
+        return 0.0
+        
+    if isinstance(timestamp, (int, float)):
+        return float(timestamp)
+        
+    timestamp_str = str(timestamp).strip()
     if not timestamp_str:
         return 0.0
     
-    parts = timestamp_str.strip().split(':')
+    parts = timestamp_str.split(':')
     parts = [float(p) for p in parts]
     
     if len(parts) == 3:
