@@ -1005,6 +1005,7 @@ dependencies = [
     { name = "rich" },
     { name = "typer" },
     { name = "whisper-ctranslate2" },
+    { name = "yt-dlp" },
 ]
 
 [package.metadata]
@@ -1015,6 +1016,7 @@ requires-dist = [
     { name = "rich" },
     { name = "typer" },
     { name = "whisper-ctranslate2" },
+    { name = "yt-dlp" },
 ]
 
 [[package]]
@@ -1502,4 +1504,13 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/5e/4f/4db55d088a82ec3f2a237f3ee0f87fc0ed8ba493bb6f21c1341d8e97a70b/whisper_ctranslate2-0.5.5.tar.gz", hash = "sha256:c314e9f8b4197268e842cad79dc08131f7f980a06259977acee557e466b02cf2", size = 25138 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/76/01/02cf1af5de600992f95cfa23a9568b05f406ecce3170a99832ee8a3071b6/whisper_ctranslate2-0.5.5-py3-none-any.whl", hash = "sha256:cec8597822585b9d6be9bbe4e63e8d857f2d125ae300420fa226bdeeebc9ba98", size = 29189 },
+]
+
+[[package]]
+name = "yt-dlp"
+version = "2025.11.12"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cf/41/53ad8c6e74d6627bd598dfbb8ad7c19d5405e438210ad0bbaf1b288387e7/yt_dlp-2025.11.12.tar.gz", hash = "sha256:5f0795a6b8fc57a5c23332d67d6c6acf819a0b46b91a6324bae29414fa97f052", size = 3076928 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5f/16/fdebbee6473473a1c0576bd165a50e4a70762484d638c1d59fa9074e175b/yt_dlp-2025.11.12-py3-none-any.whl", hash = "sha256:b47af37bbb16b08efebb36825a280ea25a507c051f93bf413a6e4a0e586c6e79", size = 3279151 },
 ]
