@@ -39,7 +39,6 @@ output/
 *.opus
 *.m4a
 *.flac
-.env.example
 test_audio.txt
 compare_sizes.py
 debug_*.py
