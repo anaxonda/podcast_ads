@@ -3,6 +3,7 @@ import os
 import sys
 import subprocess
 import json
+import shutil
 from typing import List, Dict
 from pathlib import Path
 from .utils import parse_timestamp
@@ -44,6 +45,12 @@ class AudioProcessor:
             return self._transcribe_pc(input_path, model_size, output_dir, expected_json)
 
     def _transcribe_pc(self, input_path, model_size, output_dir, expected_json):
+        # Check if binary exists
+        if shutil.which("whisper-ctranslate2") is None:
+             console.print("[red]Error: 'whisper-ctranslate2' not found.[/red]")
+             console.print("[yellow]Please run: uv sync --extra pc[/yellow]")
+             raise FileNotFoundError("whisper-ctranslate2 binary missing")
+
         console.log(f"[cyan]Starting local transcription with Whisper ({model_size})...[/cyan]")
         console.log("[dim]Settings: int8, beam=1, batch=4, vad=True[/dim]")
         

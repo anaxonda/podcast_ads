@@ -5,23 +5,31 @@ import json
 import time
 import re
 from rich.console import Console
+from openai import OpenAI
 
 console = Console()
 
 class AIEngine:
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
-        # Fallback chain: Pro (Quality) -> 2.5 Flash (Speed/Quality) -> 1.5 Flash (Reliability)
-        self.models_to_try = ["gemini-pro-latest", "gemini-2.5-flash", "gemini-flash-latest"]
+        # Fallback chain: Pro (Quality) -> 2.5 Flash (Speed/Quality) -> OpenRouter
+        self.models_to_try = ["gemini-pro-latest", "gemini-2.5-flash"]
         self.current_model_idx = 0
         self.model_name = self.models_to_try[0]
         self.model = genai.GenerativeModel(self.model_name)
+        
+        self.or_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.or_client = None
+        if self.or_api_key:
+            self.or_client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=self.or_api_key,
+            )
 
     def analyze_transcript(self, transcript_path: str) -> Dict[str, Any]:
         """
         Sends the raw Whisper JSON to Gemini in chunks to find semantic ad boundaries.
         """
-        # ... (rest of function is same until loop)
         console.log(f"[cyan]Reading transcript from {transcript_path}...[/cyan]")
         with open(transcript_path, 'r') as f:
             whisper_data = json.load(f)
@@ -104,7 +112,6 @@ class AIEngine:
             "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
         }
         
-        # Try up to 5 times to handle rate limits by switching models
         for attempt in range(5):
             response = None
             try:
@@ -137,34 +144,68 @@ class AIEngine:
             except Exception as e:
                 error_str = str(e).lower()
                 # Check for Quota/Rate Limit errors
-                if "429" in error_str or "resourceexhausted" in error_str or "quota" in error_str or "limit" in error_str:
-                    console.print(f"[yellow]Quota limit hit for {self.model_name}. Switching fallback...[/yellow]")
+                is_quota = "429" in error_str or "resourceexhausted" in error_str or "quota" in error_str or "limit" in error_str
+                # Check for Safety Block (Finish Reason 2)
+                is_safety = "finishreason" in error_str and "2" in error_str
+                
+                if is_quota or is_safety:
+                    reason = "Quota limit hit" if is_quota else "Safety block"
+                    console.print(f"[yellow]{reason} for {self.model_name}. Switching fallback...[/yellow]")
                     
-                    # Move to next model
                     self.current_model_idx += 1
                     if self.current_model_idx < len(self.models_to_try):
                         self.model_name = self.models_to_try[self.current_model_idx]
                         self.model = genai.GenerativeModel(self.model_name)
                         console.print(f"[green]Switched to {self.model_name}[/green]")
-                        time.sleep(2) # Brief pause
+                        time.sleep(2)
                         continue
                     else:
-                        console.print("[red]All AI models exhausted their quotas.[/red]")
-                        raise
-                
-                # Check for Safety Block (Finish Reason 2)
-                if "finishreason" in error_str and "2" in error_str:
-                     console.print(f"[yellow]Safety block on {self.model_name}. Switching fallback...[/yellow]")
-                     self.current_model_idx += 1
-                     if self.current_model_idx < len(self.models_to_try):
-                        self.model_name = self.models_to_try[self.current_model_idx]
-                        self.model = genai.GenerativeModel(self.model_name)
-                        console.print(f"[green]Switched to {self.model_name}[/green]")
-                        continue
+                        console.print("[red]All Gemini models exhausted.[/red]")
+                        return self._call_openrouter_chunk(prompt, chunk_data, chunk_num)
 
                 console.print(f"[yellow]Error Chunk {chunk_num}: {repr(e)}[/yellow]")
                 if response and hasattr(response, 'prompt_feedback'):
                     console.print(f"[red]Prompt Feedback: {response.prompt_feedback}[/red]")
                 time.sleep(2)
                 
-        return {}
+        # If loop finishes without success/return, try OpenRouter as last resort
+        return self._call_openrouter_chunk(prompt, chunk_data, chunk_num)
+
+    def _call_openrouter_chunk(self, prompt, chunk_data, chunk_num) -> Dict:
+        if not self.or_client:
+            console.print("[red]No OpenRouter API key found. Skipping chunk.[/red]")
+            return {}
+            
+        console.print(f"[cyan]Fallback to OpenRouter (Chunk {chunk_num})...[/cyan]")
+        # Fallback model requested by user
+        model = "x-ai/grok-4.1-fast"
+        
+        try:
+            completion = self.or_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that outputs strict JSON."},
+                    {"role": "user", "content": prompt + "\n\nDATA:\n" + chunk_data}
+                ],
+                # response_format={"type": "json_object"} # Not all OR models support this
+            )
+            text = completion.choices[0].message.content
+            
+            if text.startswith("```json"): text = text[7:]
+            if text.endswith("```"): text = text[:-3]
+            
+            try:
+                data = json.loads(text)
+                if isinstance(data, list): return {"segments_to_remove": data}
+                return data
+            except json.JSONDecodeError:
+                # Basic recovery
+                seg_match = re.search(r'"segments_to_remove"\s*:\s*(\[.*?\])', text, re.DOTALL)
+                if seg_match:
+                    try: return {"segments_to_remove": json.loads(seg_match.group(1))}
+                    except: pass
+                return {}
+                
+        except Exception as e:
+            console.print(f"[red]OpenRouter Failed: {e}[/red]")
+            return {}

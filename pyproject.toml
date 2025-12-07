@@ -10,9 +10,12 @@ dependencies = [
     "python-dotenv",
     "rich",
     "typer",
-    "whisper-ctranslate2",
     "yt-dlp",
+    "openai",
 ]
+
+[project.optional-dependencies]
+pc = ["whisper-ctranslate2"]
 
 [build-system]
 requires = ["hatchling"]
