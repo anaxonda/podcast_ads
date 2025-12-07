@@ -1,5 +1,4 @@
 import os
-import google.generativeai as genai
 from typing import List, Dict, Any
 import json
 import time
@@ -7,29 +6,46 @@ import re
 from rich.console import Console
 from openai import OpenAI
 
+# Optional Google Import
+try:
+    import google.generativeai as genai
+    HAS_GOOGLE = True
+except ImportError:
+    HAS_GOOGLE = False
+
 console = Console()
 
 class AIEngine:
-    def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        # Fallback chain: Pro (Quality) -> 2.5 Flash (Speed/Quality) -> OpenRouter
-        self.models_to_try = ["gemini-pro-latest", "gemini-2.5-flash"]
-        self.current_model_idx = 0
-        self.model_name = self.models_to_try[0]
-        self.model = genai.GenerativeModel(self.model_name)
-        
+    def __init__(self, api_key: str = None):
+        # API Keys
+        self.google_api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.or_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.openai_base_url = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+        
+        # Model Chain Configuration
+        env_order = os.getenv("AI_MODEL_ORDER")
+        if env_order:
+            self.model_chain = [m.strip() for m in env_order.split(",") if m.strip()]
+        else:
+            # Default fallback chain
+            self.model_chain = [
+                "gemini-pro-latest", 
+                "gemini-2.5-flash", 
+                "openrouter/x-ai/grok-4.1-fast"
+            ]
+            
+        # Initialize Clients
+        if HAS_GOOGLE and self.google_api_key:
+            genai.configure(api_key=self.google_api_key)
+            
         self.or_client = None
         if self.or_api_key:
             self.or_client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
+                base_url=self.openai_base_url,
                 api_key=self.or_api_key,
             )
 
     def analyze_transcript(self, transcript_path: str) -> Dict[str, Any]:
-        """
-        Sends the raw Whisper JSON to Gemini in chunks to find semantic ad boundaries.
-        """
         console.log(f"[cyan]Reading transcript from {transcript_path}...[/cyan]")
         with open(transcript_path, 'r') as f:
             whisper_data = json.load(f)
@@ -57,7 +73,6 @@ class AIEngine:
             start_time += (chunk_size_sec - overlap_sec)
 
         all_remove_segments = []
-        all_transcript_segments = []
 
         for i, chunk_segs in enumerate(chunks):
             context_note = f"This is Chunk {i+1} of {len(chunks)}. "
@@ -97,14 +112,39 @@ class AIEngine:
             """
             
             chunk_payload = json.dumps(chunk_segs)
-            response_data = self._call_gemini_chunk(prompt, chunk_payload, i+1, len(chunks))
+            
+            # Unified execution loop
+            response_data = self._process_chunk_with_fallbacks(prompt, chunk_payload, i+1)
             
             if response_data:
                 all_remove_segments.extend(response_data.get("segments_to_remove", []))
 
         return {"segments_to_remove": all_remove_segments}
 
-    def _call_gemini_chunk(self, prompt, chunk_data, chunk_num, total_chunks) -> Dict:
+    def _process_chunk_with_fallbacks(self, prompt, chunk_data, chunk_num) -> Dict:
+        """Iterates through the model chain until one succeeds."""
+        
+        for model_id in self.model_chain:
+            is_openrouter = model_id.startswith("openrouter/") or model_id.startswith("or/")
+            clean_model_name = model_id.replace("openrouter/", "").replace("or/", "")
+            
+            try:
+                if is_openrouter:
+                    return self._call_openrouter(clean_model_name, prompt, chunk_data, chunk_num)
+                else:
+                    return self._call_gemini(clean_model_name, prompt, chunk_data, chunk_num)
+            except Exception as e:
+                # If specific provider failed, log and continue to next model
+                console.print(f"[yellow]Model {clean_model_name} failed: {e}. Trying next...[/yellow]")
+                continue
+        
+        console.print(f"[bold red]All models in chain failed for Chunk {chunk_num}.[/bold red]")
+        return {}
+
+    def _call_gemini(self, model_name, prompt, chunk_data, chunk_num) -> Dict:
+        if not HAS_GOOGLE or not self.google_api_key:
+            raise RuntimeError("Google API not configured")
+
         safety_settings = {
             "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
             "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
@@ -112,100 +152,49 @@ class AIEngine:
             "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
         }
         
-        for attempt in range(5):
-            response = None
-            try:
-                with console.status(f"[bold cyan]Analyzing Text Chunk {chunk_num}/{total_chunks} (Attempt {attempt+1} | {self.model_name})...[/bold cyan]"):
-                    response = self.model.generate_content(
-                        [prompt, chunk_data],
-                        generation_config={"response_mime_type": "application/json", "max_output_tokens": 8192},
-                        safety_settings=safety_settings,
-                        stream=False
-                    )
-                    text = response.text.strip()
-                    
-                if text.startswith("```json"): text = text[7:]
-                if text.endswith("```"): text = text[:-3]
-                
-                try:
-                    data = json.loads(text)
-                    if isinstance(data, list):
-                        return {"segments_to_remove": data, "transcript_segments": []}
-                    return data
-                except json.JSONDecodeError:
-                    console.print(f"[yellow]Warning: Chunk {chunk_num} JSON malformed. Recovering...[/yellow]")
-                    segments = []
-                    seg_match = re.search(r'"segments_to_remove"\s*:\s*(\[.*?\])', text, re.DOTALL)
-                    if seg_match:
-                        try: segments = json.loads(seg_match.group(1))
-                        except: pass
-                    return {"segments_to_remove": segments, "transcript_segments": []}
-                    
-            except Exception as e:
-                error_str = str(e).lower()
-                # Check for Quota/Rate Limit errors
-                is_quota = "429" in error_str or "resourceexhausted" in error_str or "quota" in error_str or "limit" in error_str
-                # Check for Safety Block (Finish Reason 2)
-                is_safety = "finishreason" in error_str and "2" in error_str
-                
-                if is_quota or is_safety:
-                    reason = "Quota limit hit" if is_quota else "Safety block"
-                    console.print(f"[yellow]{reason} for {self.model_name}. Switching fallback...[/yellow]")
-                    
-                    self.current_model_idx += 1
-                    if self.current_model_idx < len(self.models_to_try):
-                        self.model_name = self.models_to_try[self.current_model_idx]
-                        self.model = genai.GenerativeModel(self.model_name)
-                        console.print(f"[green]Switched to {self.model_name}[/green]")
-                        time.sleep(2)
-                        continue
-                    else:
-                        console.print("[red]All Gemini models exhausted.[/red]")
-                        return self._call_openrouter_chunk(prompt, chunk_data, chunk_num)
+        with console.status(f"[bold cyan]Analyzing Chunk {chunk_num} (Google: {model_name})...[/bold cyan]"):
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                [prompt, chunk_data],
+                generation_config={"response_mime_type": "application/json", "max_output_tokens": 8192},
+                safety_settings=safety_settings,
+                stream=False
+            )
+            text = response.text.strip()
+            return self._parse_response(text)
 
-                console.print(f"[yellow]Error Chunk {chunk_num}: {repr(e)}[/yellow]")
-                if response and hasattr(response, 'prompt_feedback'):
-                    console.print(f"[red]Prompt Feedback: {response.prompt_feedback}[/red]")
-                time.sleep(2)
-                
-        # If loop finishes without success/return, try OpenRouter as last resort
-        return self._call_openrouter_chunk(prompt, chunk_data, chunk_num)
-
-    def _call_openrouter_chunk(self, prompt, chunk_data, chunk_num) -> Dict:
+    def _call_openrouter(self, model_name, prompt, chunk_data, chunk_num) -> Dict:
         if not self.or_client:
-            console.print("[red]No OpenRouter API key found. Skipping chunk.[/red]")
-            return {}
+            raise RuntimeError("OpenRouter API not configured")
             
-        console.print(f"[cyan]Fallback to OpenRouter (Chunk {chunk_num})...[/cyan]")
-        # Fallback model requested by user
-        model = "x-ai/grok-4.1-fast"
-        
-        try:
+        with console.status(f"[bold cyan]Analyzing Chunk {chunk_num} (OpenRouter: {model_name})...[/bold cyan]"):
             completion = self.or_client.chat.completions.create(
-                model=model,
+                model=model_name,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant that outputs strict JSON."},
                     {"role": "user", "content": prompt + "\n\nDATA:\n" + chunk_data}
                 ],
-                # response_format={"type": "json_object"} # Not all OR models support this
             )
             text = completion.choices[0].message.content
-            
-            if text.startswith("```json"): text = text[7:]
-            if text.endswith("```"): text = text[:-3]
-            
-            try:
-                data = json.loads(text)
-                if isinstance(data, list): return {"segments_to_remove": data}
-                return data
-            except json.JSONDecodeError:
-                # Basic recovery
-                seg_match = re.search(r'"segments_to_remove"\s*:\s*(\[.*?\])', text, re.DOTALL)
-                if seg_match:
-                    try: return {"segments_to_remove": json.loads(seg_match.group(1))}
-                    except: pass
-                return {}
-                
-        except Exception as e:
-            console.print(f"[red]OpenRouter Failed: {e}[/red]")
-            return {}
+            return self._parse_response(text)
+
+    def _parse_response(self, text) -> Dict:
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return {"segments_to_remove": data}
+            return data
+        except json.JSONDecodeError:
+            segments = []
+            seg_match = re.search(r'"segments_to_remove"\s*:\s*(\[.*?\])', text, re.DOTALL)
+            if seg_match:
+                try:
+                    segments = json.loads(seg_match.group(1))
+                except:
+                    pass
+            return {"segments_to_remove": segments}

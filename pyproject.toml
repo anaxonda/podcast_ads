@@ -5,7 +5,6 @@ description = "AI-powered podcast ad stripper and transcriber"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "google-generativeai",
     "ffmpeg-python",
     "python-dotenv",
     "rich",
@@ -16,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pc = ["whisper-ctranslate2"]
+google = ["google-generativeai"]
 
 [build-system]
 requires = ["hatchling"]
