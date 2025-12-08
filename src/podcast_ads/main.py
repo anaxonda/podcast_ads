@@ -17,6 +17,7 @@ from .utils import parse_timestamp
 
 import json
 import re # For cleaning filenames
+from urllib.parse import urlparse # For generic URL parsing
 
 # Load environment variables
 load_dotenv()
@@ -248,20 +249,27 @@ def _process_single_item_logic(
     
     # --- Determine File Stem and Initial Media Path ---
     if is_url:
-        # Use MediaDownloader to get info for a stable file_stem (title or ID)
         try:
-            md_loader = MediaDownloader(output_dir=str(out_path))
-            info = yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True}).extract_info(current_input_target, download=False)
-            
             if is_youtube:
+                md_loader = MediaDownloader(output_dir=str(out_path))
+                info = yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True}).extract_info(current_input_target, download=False)
                 file_stem_raw = info.get('title', info.get('id', 'youtube_video'))
-            else:
-                # Generic URLs need stable hash for cache consistency
+            else: # Generic URL (not YouTube)
+                # Ensure file_stem is 100% stable, based only on the input URL, not yt-dlp's dynamic info.
                 url_hash = hashlib.md5(current_input_target.encode('utf-8')).hexdigest()
-                title = info.get('title', 'audio')
-                file_stem_raw = f"{title}_{url_hash[:10]}"
+                
+                try:
+                    parsed_url = urlparse(current_input_target)
+                    # Use domain + path for a readable base name
+                    domain = parsed_url.netloc.split('.')[0] if parsed_url.netloc else "media"
+                    path_slug = Path(parsed_url.path).stem # e.g. "san_luis_potos"
+                    if not path_slug or len(path_slug) < 3: path_slug = "audio"
 
-            # Sanitize filename
+                    file_stem_raw = f"{domain}_{path_slug}_{url_hash[:8]}" # Shorter hash for readability
+                except:
+                    file_stem_raw = f"generic_media_{url_hash[:10]}"
+
+            # Sanitize filename (applies to both YouTube and Generic)
             file_stem = re.sub(r'[^\w\-_\.]', '', file_stem_raw) 
             file_stem = file_stem[:50].strip() # Truncate and strip
             if not file_stem: file_stem = "generic_media_item" 
@@ -362,8 +370,7 @@ def _process_single_item_logic(
     if play or play_audio:
         player = Player()
         # For play, use the original input target (URL or local path)
-        play_target = current_input_target 
-        player.play_with_skips(play_target, skips_lua_path, audio_only=play_audio, segments=segments_to_remove)
+        player.play_with_skips(current_input_target, skips_lua_path, audio_only=play_audio, segments=segments_to_remove)
         return # Play mode finishes the process for this item
 
     # --- Dry Run ---
@@ -387,8 +394,10 @@ def _process_single_item_logic(
 
         final_media_output_path: Path
         if save_clean_audio:
+            # Always output MP3 for clean audio
             final_media_output_path = out_path / f"{file_stem}_clean.mp3" 
-            if actual_media_path.suffix.lower() not in ['.mp3', '.m4a', '.wav']:
+            # If original media is not MP3, convert it before cutting
+            if actual_media_path.suffix.lower() not in ['.mp3', '.m4a', '.wav']: # Common audio formats
                 console.print(f"[cyan]Converting {actual_media_path.suffix} to MP3 for clean audio output...[/cyan]")
                 temp_audio_path = out_path / f"{file_stem}_temp_audio.mp3"
                 try:
@@ -402,11 +411,11 @@ def _process_single_item_logic(
                     if temp_audio_path.exists():
                         temp_audio_path.unlink()
                 except Exception as e:
-                    console.print(f"[red]Error converting to MP3: {e}[/red]")
+                    console.print(f"[red]Error converting to MP3 for save_clean_audio: {e}[/red]")
                     raise
-            else:
+            else: # Already an audio file
                 processor.cut_and_merge(str(actual_media_path), str(final_media_output_path), segments_to_remove)
-        else: 
+        else: # save_clean (original format, or best video+audio for YouTube)
             final_media_output_path = out_path / f"{file_stem}_clean{actual_media_path.suffix}"
             processor.cut_and_merge(str(actual_media_path), str(final_media_output_path), segments_to_remove)
         
