@@ -119,6 +119,6 @@ end)
             "am", "start",
             "-a", "android.intent.action.VIEW",
             "-d", media_path,
-            "-n", "com.mehiz.mpv/is.xyz.mpv.MPVActivity"
+            "-n", "live.mehiz.mpvkt/is.xyz.mpv.MPVActivity"
         ]
         subprocess.run(cmd)

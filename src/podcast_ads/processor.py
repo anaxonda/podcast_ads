@@ -89,7 +89,24 @@ class AudioProcessor:
         Android-specific transcription using whisper.cpp and ffmpeg pipe.
         """
         base_dir = os.path.expanduser("~/whisper.cpp")
-        whisper_bin = os.path.join(base_dir, "main")
+        
+        # Check common paths for binary (main or whisper-cli)
+        # CMake builds usually put it in build/bin/, Makefiles in root
+        possible_bins = [
+            os.path.join(base_dir, "build", "bin", "whisper-cli"),
+            os.path.join(base_dir, "build", "bin", "main"),
+            os.path.join(base_dir, "bin", "whisper-cli"),
+            os.path.join(base_dir, "bin", "main"),
+            os.path.join(base_dir, "whisper-cli"),
+            os.path.join(base_dir, "main"),
+        ]
+        
+        whisper_bin = None
+        for p in possible_bins:
+            if os.path.exists(p):
+                whisper_bin = p
+                break
+                
         # Map model size to q5_1 quantized models which are good for mobile
         model_map = {
             "tiny": "ggml-tiny.en-q5_1.bin",
@@ -100,8 +117,8 @@ class AudioProcessor:
         model_fname = model_map.get(model_size, "ggml-tiny.en-q5_1.bin")
         model_path = os.path.join(base_dir, "models", model_fname)
 
-        if not os.path.exists(whisper_bin):
-            raise FileNotFoundError(f"Whisper binary not found at {whisper_bin}. Check Termux setup.")
+        if not whisper_bin:
+            raise FileNotFoundError(f"Whisper binary not found in {base_dir}. Check build (CMake uses build/bin/).")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at {model_path}. Please download it in whisper.cpp/models.")
 
