@@ -27,6 +27,90 @@ console = Console()
 
 IS_ANDROID = "com.termux" in os.environ.get("PREFIX", "")
 
+# --- File Stem Utilities ---
+def _sanitize_file_stem(value: str, max_len: int = 80) -> str:
+    """Sanitize and trim a filename stem."""
+    sanitized = re.sub(r'[^\w\-_\.]', '', value)
+    sanitized = sanitized.strip("._-")
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len]
+    return sanitized or "media_item"
+
+def _short_hash(value: str, length: int = 10) -> str:
+    return hashlib.md5(value.encode("utf-8")).hexdigest()[:length]
+
+def _extract_youtube_id(parsed_url) -> Optional[str]:
+    """
+    Best-effort YouTube ID extraction without network calls.
+    Supports typical watch URLs and youtu.be shortlinks.
+    """
+    if not parsed_url:
+        return None
+
+    query = parsed_url.query or ""
+    if "v=" in query:
+        for part in query.split("&"):
+            if part.startswith("v="):
+                vid = part.replace("v=", "").strip()
+                if vid:
+                    return vid
+
+    path_parts = (parsed_url.path or "").strip("/").split("/")
+    if parsed_url.netloc and "youtu.be" in parsed_url.netloc and path_parts:
+        return path_parts[-1] or None
+
+    # Fallback: last path segment if it looks like an ID
+    if path_parts:
+        candidate = path_parts[-1]
+        if len(candidate) in (11, 12): # common YT id lengths
+            return candidate
+    return None
+
+def _build_candidate_stems(current_input_target: str, is_url: bool, is_youtube: bool) -> List[str]:
+    """
+    Returns ordered candidate stems to look for cached artifacts.
+    1) Stable slug based on normalized input (primary)
+    2) Legacy/local stem fallbacks (to reuse previous outputs)
+    """
+    candidates: List[str] = []
+    normalized_target = current_input_target.strip()
+
+    if is_url:
+        parsed = urlparse(normalized_target)
+        netloc = (parsed.netloc or "").lower()
+        path_stem = Path(parsed.path).stem
+        short = _short_hash(normalized_target, length=8)
+
+        if is_youtube:
+            vid = _extract_youtube_id(parsed)
+            base_label = vid or path_stem or "youtube"
+            primary = _sanitize_file_stem(f"{base_label}_{short}")
+            candidates.append(primary)
+            # Legacy: bare video id or title-based names (title handled later on cache miss)
+            if vid:
+                candidates.append(_sanitize_file_stem(vid))
+        else:
+            domain = netloc.split(":")[0] if netloc else "media"
+            slug_base = path_stem if len(path_stem) >= 3 else "audio"
+            primary = _sanitize_file_stem(f"{domain}_{slug_base}_{short}")
+            candidates.append(primary)
+    else:
+        abs_path = str(Path(current_input_target).expanduser().resolve())
+        base_stem = Path(current_input_target).stem
+        primary = _sanitize_file_stem(f"{base_stem}_{_short_hash(abs_path, length=8)}")
+        candidates.append(primary)
+        # Legacy/local fallback: plain stem (old behavior)
+        candidates.append(_sanitize_file_stem(base_stem))
+
+    # Remove dups while preserving order
+    deduped = []
+    seen = set()
+    for stem in candidates:
+        if stem not in seen:
+            deduped.append(stem)
+            seen.add(stem)
+    return deduped
+
 # --- Helper Functions for Output Generation ---
 def _generate_lua_script(file_stem: str, out_path: Path, segments_to_remove: List[Dict]) -> str:
     """Generates and saves an MPV Lua script for skipping segments."""
@@ -240,56 +324,70 @@ def _process_single_item_logic(
     dry_run: bool
 ):
     is_url = current_input_target.startswith("http") # True if any HTTP URL
+    normalized_input = current_input_target.strip()
     segments_to_remove: List[Dict] = []
     
     transcript_json_path: Optional[str] = None # Path to Whisper/YT captions JSON
     actual_media_path: Optional[Path] = None # Path to local media file (downloaded or original)
     
-    file_stem: str # Base name for output files
+    # --- Determine File Stem Candidates (stable + legacy) ---
+    file_stem_candidates = _build_candidate_stems(normalized_input, is_url=is_url, is_youtube=is_youtube)
+    file_stem = file_stem_candidates[0] if file_stem_candidates else "generic_media_item"
+
+    # Keep original path handy for local inputs
+    if not is_url:
+        actual_media_path = Path(normalized_input)
     
-    # --- Determine File Stem and Initial Media Path ---
-    if is_url:
+    # Legacy YouTube stem (title-based) for cache reuse; only compute if needed
+    legacy_title_stem: Optional[str] = None
+
+    def _try_legacy_ytdlp_stem() -> Optional[str]:
+        nonlocal legacy_title_stem
+        if legacy_title_stem is not None:
+            return legacy_title_stem
         try:
-            if is_youtube:
-                md_loader = MediaDownloader(output_dir=str(out_path))
-                info = yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True}).extract_info(current_input_target, download=False)
-                file_stem_raw = info.get('title', info.get('id', 'youtube_video'))
-            else: # Generic URL (not YouTube)
-                # Ensure file_stem is 100% stable, based only on the input URL, not yt-dlp's dynamic info.
-                url_hash = hashlib.md5(current_input_target.encode('utf-8')).hexdigest()
-                
-                try:
-                    parsed_url = urlparse(current_input_target)
-                    # Use domain + path for a readable base name
-                    domain = parsed_url.netloc.split('.')[0] if parsed_url.netloc else "media"
-                    path_slug = Path(parsed_url.path).stem # e.g. "san_luis_potos"
-                    if not path_slug or len(path_slug) < 3: path_slug = "audio"
-
-                    file_stem_raw = f"{domain}_{path_slug}_{url_hash[:8]}" # Shorter hash for readability
-                except:
-                    file_stem_raw = f"generic_media_{url_hash[:10]}"
-
-            # Sanitize filename (applies to both YouTube and Generic)
-            file_stem = re.sub(r'[^\w\-_\.]', '', file_stem_raw) 
-            file_stem = file_stem[:50].strip() # Truncate and strip
-            if not file_stem: file_stem = "generic_media_item" 
+            info = yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True}).extract_info(normalized_input, download=False)
+            legacy_title_stem = _sanitize_file_stem(info.get('title') or info.get('id') or "")
+            return legacy_title_stem or None
         except Exception:
-            file_stem = "generic_media_item" # Fallback
-    else:
-        actual_media_path = Path(current_input_target)
-        file_stem = actual_media_path.stem
+            legacy_title_stem = None
+            return None
 
     # --- Cache Check ---
     cache_file = out_path / f"{file_stem}_analysis.json"
     analysis = None
     
-    if cache_file.exists():
-        console.print(f"[yellow]Found cached analysis at {cache_file}. Using it.[/yellow]")
+    # --- Cache Discovery (primary + legacy stems) ---
+    cache_candidates = [out_path / f"{stem}_analysis.json" for stem in file_stem_candidates]
+
+    def _load_first_existing(candidates: List[Path]) -> Optional[Path]:
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    found_cache = _load_first_existing(cache_candidates)
+
+    # Last-chance legacy: title-based youtube stem (only if nothing matched)
+    if not found_cache and is_url and is_youtube:
+        legacy_title = _try_legacy_ytdlp_stem()
+        if legacy_title:
+            legacy_path = out_path / f"{legacy_title}_analysis.json"
+            file_stem_candidates.append(legacy_title)
+            cache_candidates.append(legacy_path)
+            found_cache = _load_first_existing([legacy_path])
+
+    if found_cache:
+        file_stem = found_cache.name.replace("_analysis.json", "")
+        console.print(f"[yellow]Found cached analysis at {found_cache}. Using it.[/yellow]")
         try:
-            with open(cache_file, 'r') as f:
+            with open(found_cache, 'r') as f:
                 analysis = json.load(f)
-        except:
+        except Exception:
             console.print("[red]Cache invalid, re-running AI...[/red]")
+            analysis = None
+    # Refresh cache_file to align with the resolved stem (primary or legacy)
+    cache_file = out_path / f"{file_stem}_analysis.json"
 
     # --- Run Analysis if not in Cache ---
     if not analysis:
@@ -346,9 +444,19 @@ def _process_single_item_logic(
             # We ignore 'transcript_segments' from AI now, as we build it locally
             
         # --- Save Analysis to Cache ---
+        cache_payload = {
+            "input_meta": {
+                "input": normalized_input,
+                "is_url": is_url,
+                "is_youtube": is_youtube,
+                "file_stem": file_stem,
+                "schema_version": "v1"
+            },
+            "segments_to_remove": segments_to_remove,
+            "transcript_segments": []
+        }
         with open(cache_file, 'w') as f:
-            # We save empty transcript_segments list to maintain schema, or could remove it
-            json.dump({"segments_to_remove": segments_to_remove, "transcript_segments": []}, f, indent=2)
+            json.dump(cache_payload, f, indent=2)
     else:
         # Load segments from cache
         segments_to_remove = analysis.get("segments_to_remove", [])
